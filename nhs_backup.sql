@@ -160,7 +160,330 @@ UNLOCK TABLES;
 --
 
 DROP TABLE IF EXISTS `medications`;
-/*!40101 SET @saved_cs_client     = @@character_set_client */;
+/*!40101 SET @saved_cs_client     = @@character_set_client */;-- NHS Parts C & D Submission Support Script
+-- Run this AFTER importing nhs_backup.sql into MySQL Workbench.
+-- Purpose: provide executable evidence for stored procedure, trigger, RBAC, hashing,
+-- prepared statements, and assessment-aligned validation queries.
+
+CREATE DATABASE IF NOT EXISTS nhs_group_db;
+USE nhs_group_db;
+
+-- -----------------------------------------------------------------------------
+-- 1. Optional data-quality constraint: medication names should not be duplicated.
+-- The conditional block below avoids failing if the constraint already exists.
+-- -----------------------------------------------------------------------------
+SET @uq_medication_name_exists = (
+    SELECT COUNT(*)
+    FROM information_schema.TABLE_CONSTRAINTS
+    WHERE CONSTRAINT_SCHEMA = DATABASE()
+      AND TABLE_NAME = 'medications'
+      AND CONSTRAINT_NAME = 'uq_medication_name'
+);
+
+SET @uq_medication_sql = IF(
+    @uq_medication_name_exists = 0,
+    'ALTER TABLE medications ADD CONSTRAINT uq_medication_name UNIQUE (MedicationName)',
+    'SELECT ''uq_medication_name already exists'' AS Info'
+);
+
+PREPARE uq_medication_stmt FROM @uq_medication_sql;
+EXECUTE uq_medication_stmt;
+DEALLOCATE PREPARE uq_medication_stmt;
+
+-- -----------------------------------------------------------------------------
+-- 2. Part C: Advanced query examples for screenshots and explanation.
+-- -----------------------------------------------------------------------------
+
+-- Query A: Complete clinical record view using multiple JOINs.
+SELECT
+    p.PatientID,
+    p.PatientName,
+    a.AppointmentID,
+    a.AppointmentDate,
+    a.AppointmentTime,
+    d.DoctorName,
+    d.DoctorSpecialty,
+    c.ClinicName,
+    m.MedicationName,
+    a.Notes
+FROM appointments AS a
+JOIN patients AS p
+    ON a.PatientID = p.PatientID
+JOIN doctors AS d
+    ON a.DoctorID = d.DoctorID
+JOIN clinics AS c
+    ON d.ClinicID = c.ClinicID
+LEFT JOIN appointment_medication AS am
+    ON a.AppointmentID = am.appointmentid
+LEFT JOIN medications AS m
+    ON am.medicationid = m.MedicationID
+ORDER BY p.PatientName, a.AppointmentDate, m.MedicationName;
+
+-- Query B: Clinic workload and unique patient reach.
+SELECT
+    c.ClinicID,
+    c.ClinicName,
+    COUNT(a.AppointmentID) AS TotalAppointments,
+    COUNT(DISTINCT a.PatientID) AS UniquePatients
+FROM clinics AS c
+LEFT JOIN doctors AS d
+    ON c.ClinicID = d.ClinicID
+LEFT JOIN appointments AS a
+    ON d.DoctorID = a.DoctorID
+GROUP BY c.ClinicID, c.ClinicName
+ORDER BY c.ClinicID;
+
+-- Query C: Appointment volume by weekday.
+SELECT
+    DAYNAME(AppointmentDate) AS AppointmentDay,
+    COUNT(AppointmentID) AS TotalAppointments
+FROM appointments
+GROUP BY DAYNAME(AppointmentDate), DAYOFWEEK(AppointmentDate)
+ORDER BY DAYOFWEEK(AppointmentDate);
+
+-- Query D: Patient coverage report, including inactive patients.
+SELECT
+    p.PatientID,
+    p.PatientName,
+    a.AppointmentID,
+    a.AppointmentDate
+FROM patients AS p
+LEFT JOIN appointments AS a
+    ON p.PatientID = a.PatientID
+ORDER BY p.PatientName ASC;
+
+-- Query E: Clinic audit using RIGHT JOIN to prioritise all clinic records.
+SELECT
+    d.DoctorName,
+    d.DoctorSpecialty,
+    c.ClinicID,
+    c.ClinicName,
+    c.ClinicAddress
+FROM doctors AS d
+RIGHT JOIN clinics AS c
+    ON d.ClinicID = c.ClinicID
+ORDER BY c.ClinicID;
+
+-- Query F: FULL OUTER JOIN equivalent in MySQL using LEFT JOIN + RIGHT JOIN + UNION.
+SELECT
+    a.AppointmentID,
+    a.AppointmentDate,
+    d.DoctorName
+FROM appointments AS a
+LEFT JOIN doctors AS d
+    ON a.DoctorID = d.DoctorID
+UNION
+SELECT
+    a.AppointmentID,
+    a.AppointmentDate,
+    d.DoctorName
+FROM appointments AS a
+RIGHT JOIN doctors AS d
+    ON a.DoctorID = d.DoctorID;
+
+-- -----------------------------------------------------------------------------
+-- 3. Stored procedure: GetPatientMedicalHistory.
+-- -----------------------------------------------------------------------------
+DROP PROCEDURE IF EXISTS GetPatientMedicalHistory;
+
+DELIMITER //
+CREATE PROCEDURE GetPatientMedicalHistory(IN targetPatientID VARCHAR(255))
+BEGIN
+    SELECT
+        p.PatientID,
+        p.PatientName,
+        a.AppointmentID,
+        a.AppointmentDate,
+        a.AppointmentTime,
+        d.DoctorName,
+        d.DoctorSpecialty,
+        m.MedicationName,
+        a.Notes
+    FROM patients AS p
+    LEFT JOIN appointments AS a
+        ON p.PatientID = a.PatientID
+    LEFT JOIN doctors AS d
+        ON a.DoctorID = d.DoctorID
+    LEFT JOIN appointment_medication AS am
+        ON a.AppointmentID = am.appointmentid
+    LEFT JOIN medications AS m
+        ON am.medicationid = m.MedicationID
+    WHERE p.PatientID = targetPatientID
+    ORDER BY a.AppointmentDate, a.AppointmentTime, m.MedicationName;
+END //
+DELIMITER ;
+
+-- Procedure test for screenshot evidence.
+CALL GetPatientMedicalHistory('P001');
+
+-- -----------------------------------------------------------------------------
+-- 4. Audit trigger for appointment note changes.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS appointment_audit_log (
+    LogID INT NOT NULL AUTO_INCREMENT,
+    AppointmentID VARCHAR(50) NOT NULL,
+    OldNotes TEXT,
+    NewNotes TEXT,
+    ChangedAt DATETIME NOT NULL,
+    ChangedBy VARCHAR(100) NOT NULL,
+    PRIMARY KEY (LogID)
+);
+
+DROP TRIGGER IF EXISTS after_appointment_notes_update;
+
+DELIMITER //
+CREATE TRIGGER after_appointment_notes_update
+AFTER UPDATE ON appointments
+FOR EACH ROW
+BEGIN
+    IF NOT (OLD.Notes <=> NEW.Notes) THEN
+        INSERT INTO appointment_audit_log
+            (AppointmentID, OldNotes, NewNotes, ChangedAt, ChangedBy)
+        VALUES
+            (OLD.AppointmentID, OLD.Notes, NEW.Notes, NOW(), USER());
+    END IF;
+END //
+DELIMITER ;
+
+-- Trigger test for screenshot evidence.
+-- NOTE: Card250524's Notes already equal a prior verification string in nhs_backup.sql
+-- (a LogID=1 row from an earlier test run already exists in appointment_audit_log).
+-- The trigger only fires when OLD.Notes differs from NEW.Notes, so the update below
+-- includes NOW() to guarantee a change and produce a fresh, dated audit row.
+UPDATE appointments
+SET Notes = CONCAT('SYSTEM AUDIT UPDATE: Verification test run ', NOW())
+WHERE AppointmentID = 'Card250524';
+
+SELECT *
+FROM appointment_audit_log
+WHERE AppointmentID = 'Card250524'
+ORDER BY ChangedAt DESC;
+
+-- -----------------------------------------------------------------------------
+-- 5. Part D1: Role-Based Access Control (RBAC).
+-- Uses MySQL roles and assigns them to four user types.
+-- Replace the demonstration passwords before using in a live environment.
+-- -----------------------------------------------------------------------------
+CREATE ROLE IF NOT EXISTS 'role_administrator';
+CREATE ROLE IF NOT EXISTS 'role_doctor';
+CREATE ROLE IF NOT EXISTS 'role_receptionist';
+CREATE ROLE IF NOT EXISTS 'role_patient';
+
+-- Administrator: full database control.
+GRANT ALL PRIVILEGES ON nhs_group_db.* TO 'role_administrator';
+
+-- Doctor: clinical read access and limited ability to update appointment notes.
+GRANT SELECT ON nhs_group_db.patients TO 'role_doctor';
+GRANT SELECT ON nhs_group_db.doctors TO 'role_doctor';
+GRANT SELECT ON nhs_group_db.clinics TO 'role_doctor';
+GRANT SELECT ON nhs_group_db.medications TO 'role_doctor';
+GRANT SELECT ON nhs_group_db.appointment_medication TO 'role_doctor';
+GRANT SELECT ON nhs_group_db.appointments TO 'role_doctor';
+GRANT UPDATE (Notes) ON nhs_group_db.appointments TO 'role_doctor';
+
+-- Receptionist: operational access to patient and appointment administration.
+GRANT SELECT ON nhs_group_db.doctors TO 'role_receptionist';
+GRANT SELECT ON nhs_group_db.clinics TO 'role_receptionist';
+GRANT SELECT, INSERT, UPDATE ON nhs_group_db.patients TO 'role_receptionist';
+GRANT SELECT, INSERT, UPDATE ON nhs_group_db.appointments TO 'role_receptionist';
+
+-- Patient-facing safe view: avoids exposing full clinical notes or system tables.
+CREATE OR REPLACE VIEW patient_appointment_summary AS
+SELECT
+    p.PatientID,
+    p.PatientName,
+    a.AppointmentDate,
+    a.AppointmentTime,
+    d.DoctorName,
+    c.ClinicName
+FROM patients AS p
+LEFT JOIN appointments AS a
+    ON p.PatientID = a.PatientID
+LEFT JOIN doctors AS d
+    ON a.DoctorID = d.DoctorID
+LEFT JOIN clinics AS c
+    ON d.ClinicID = c.ClinicID;
+
+GRANT SELECT ON nhs_group_db.patient_appointment_summary TO 'role_patient';
+
+CREATE USER IF NOT EXISTS 'Administrator'@'localhost' IDENTIFIED BY 'ChangeMe_Admin_2026!';
+CREATE USER IF NOT EXISTS 'Doctor'@'localhost' IDENTIFIED BY 'ChangeMe_Doctor_2026!';
+CREATE USER IF NOT EXISTS 'Receptionist'@'localhost' IDENTIFIED BY 'ChangeMe_Reception_2026!';
+CREATE USER IF NOT EXISTS 'Patient'@'localhost' IDENTIFIED BY 'ChangeMe_Patient_2026!';
+
+GRANT 'role_administrator' TO 'Administrator'@'localhost';
+GRANT 'role_doctor' TO 'Doctor'@'localhost';
+GRANT 'role_receptionist' TO 'Receptionist'@'localhost';
+GRANT 'role_patient' TO 'Patient'@'localhost';
+
+SET DEFAULT ROLE 'role_administrator' TO 'Administrator'@'localhost';
+SET DEFAULT ROLE 'role_doctor' TO 'Doctor'@'localhost';
+SET DEFAULT ROLE 'role_receptionist' TO 'Receptionist'@'localhost';
+SET DEFAULT ROLE 'role_patient' TO 'Patient'@'localhost';
+
+-- Evidence query for role/user checking.
+SHOW GRANTS FOR 'Doctor'@'localhost';
+SHOW GRANTS FOR 'Receptionist'@'localhost';
+SHOW GRANTS FOR 'Patient'@'localhost';
+
+-- -----------------------------------------------------------------------------
+-- 6. Part D2: Data protection using salted SHA-256 password hashing.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS auth_users (
+    UserID INT NOT NULL AUTO_INCREMENT,
+    Username VARCHAR(100) NOT NULL UNIQUE,
+    UserRole VARCHAR(50) NOT NULL,
+    Salt VARCHAR(100) NOT NULL,
+    PasswordHash CHAR(64) NOT NULL,
+    PRIMARY KEY (UserID)
+);
+
+INSERT INTO auth_users (Username, UserRole, Salt, PasswordHash)
+VALUES
+    ('Administrator', 'Administrator', 'admin_salt_2026', SHA2(CONCAT('admin_salt_2026', 'ChangeMe_Admin_2026!'), 256)),
+    ('Doctor', 'Doctor', 'doctor_salt_2026', SHA2(CONCAT('doctor_salt_2026', 'ChangeMe_Doctor_2026!'), 256)),
+    ('Receptionist', 'Receptionist', 'reception_salt_2026', SHA2(CONCAT('reception_salt_2026', 'ChangeMe_Reception_2026!'), 256)),
+    ('Patient', 'Patient', 'patient_salt_2026', SHA2(CONCAT('patient_salt_2026', 'ChangeMe_Patient_2026!'), 256))
+ON DUPLICATE KEY UPDATE
+    UserRole = VALUES(UserRole),
+    Salt = VALUES(Salt),
+    PasswordHash = VALUES(PasswordHash);
+
+-- Secure login demonstration with a prepared statement.
+-- This separates user input from executable SQL and reduces SQL injection risk.
+SET @login_sql = '
+    SELECT UserID, Username, UserRole
+    FROM auth_users
+    WHERE Username = ?
+      AND PasswordHash = SHA2(CONCAT(Salt, ?), 256)
+';
+SET @input_username = 'Doctor';
+SET @input_password = 'ChangeMe_Doctor_2026!';
+
+PREPARE login_stmt FROM @login_sql;
+EXECUTE login_stmt USING @input_username, @input_password;
+DEALLOCATE PREPARE login_stmt;
+
+-- -----------------------------------------------------------------------------
+-- 7. Transaction-management demonstration for controlled testing.
+-- ROLLBACK prevents permanent changes during screenshot testing.
+-- -----------------------------------------------------------------------------
+START TRANSACTION;
+
+UPDATE appointments
+SET Notes = 'TRANSACTION TEST: temporary note update for validation.'
+WHERE AppointmentID = 'Psych100524';
+
+SELECT AppointmentID, Notes
+FROM appointments
+WHERE AppointmentID = 'Psych100524';
+
+ROLLBACK;
+
+SELECT AppointmentID, Notes
+FROM appointments
+WHERE AppointmentID = 'Psych100524';
+
 /*!50503 SET character_set_client = utf8mb4 */;
 CREATE TABLE `medications` (
   `MedicationID` varchar(50) NOT NULL,
